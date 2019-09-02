@@ -1,10 +1,10 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
+ * contributor license agreements. See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
  * The ASF licenses this file to You under the Apache License, Version 2.0
  * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
+ * the License. You may obtain a copy of the License at
  *
  *    http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -14,9 +14,9 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.kafka.common.utils;
 
+import java.io.Serializable;
 import java.util.Arrays;
 import java.util.Comparator;
 
@@ -24,6 +24,8 @@ import java.util.Comparator;
  * Utility class that handles immutable byte arrays.
  */
 public class Bytes implements Comparable<Bytes> {
+
+    public static final byte[] EMPTY = new byte[0];
 
     private static final char[] HEX_CHARS_UPPER = {'0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F'};
 
@@ -33,6 +35,8 @@ public class Bytes implements Comparable<Bytes> {
     private int hashCode;
 
     public static Bytes wrap(byte[] bytes) {
+        if (bytes == null)
+            return null;
         return new Bytes(bytes);
     }
 
@@ -50,7 +54,7 @@ public class Bytes implements Comparable<Bytes> {
 
     /**
      * Get the data from the Bytes.
-     * @return The data is only valid between offset and offset+length.
+     * @return The underlying byte array
      */
     public byte[] get() {
         return this.bytes;
@@ -75,6 +79,8 @@ public class Bytes implements Comparable<Bytes> {
     public boolean equals(Object other) {
         if (this == other)
             return true;
+        if (other == null)
+            return false;
 
         // we intentionally use the function to compute hashcode here
         if (this.hashCode() != other.hashCode())
@@ -135,11 +141,11 @@ public class Bytes implements Comparable<Bytes> {
     }
 
     /**
-     * A byte array comparator based on lexicograpic ordering.
+     * A byte array comparator based on lexicographic ordering.
      */
-    public final static Comparator<byte[]> BYTES_LEXICO_COMPARATOR = new LexicographicByteArrayComparator();
+    public final static ByteArrayComparator BYTES_LEXICO_COMPARATOR = new LexicographicByteArrayComparator();
 
-    private interface ByteArrayComparator extends Comparator<byte[]> {
+    public interface ByteArrayComparator extends Comparator<byte[]>, Serializable {
 
         int compare(final byte[] buffer1, int offset1, int length1,
                     final byte[] buffer2, int offset2, int length2);

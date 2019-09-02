@@ -16,44 +16,25 @@
  */
 package kafka
 
-import java.io.{File, FileOutputStream}
-import java.security.Permission
+import java.io.File
+import java.nio.file.Files
 import java.util
 
 import kafka.server.KafkaConfig
-import org.apache.kafka.common.config.SslConfigs
+import kafka.utils.Exit
 import org.apache.kafka.common.config.types.Password
+import org.apache.kafka.common.internals.FatalExitError
 import org.junit.{After, Before, Test}
 import org.junit.Assert._
+import org.apache.kafka.common.config.internals.BrokerSecurityConfigs
 
 class KafkaTest {
 
-  val originalSecurityManager: SecurityManager = System.getSecurityManager
-
-  class ExitCalled extends SecurityException {
-  }
-
-  private class NoExitSecurityManager extends SecurityManager {
-    override def checkExit(status: Int): Unit = {
-      throw new ExitCalled
-    }
-
-    override def checkPermission(perm : Permission): Unit = {
-    }
-
-    override def checkPermission(perm : Permission, context: Object): Unit = {
-    }
-  }
-
   @Before
-  def setSecurityManager() : Unit = {
-    System.setSecurityManager(new NoExitSecurityManager)
-  }
+  def setUp(): Unit = Exit.setExitProcedure((status, _) => throw new FatalExitError(status))
 
   @After
-  def setOriginalSecurityManager() : Unit = {
-    System.setSecurityManager(originalSecurityManager)
-  }
+  def tearDown(): Unit = Exit.resetExitProcedure()
 
   @Test
   def testGetKafkaConfigFromArgs(): Unit = {
@@ -78,25 +59,19 @@ class KafkaTest {
     assertEquals(util.Arrays.asList("compact","delete"), config4.logCleanupPolicy)
   }
 
-  @Test(expected = classOf[ExitCalled])
-  def testGetKafkaConfigFromArgsWrongSetValue(): Unit = {
-    val propertiesFile = prepareDefaultConfig()
-    KafkaConfig.fromProps(Kafka.getPropsFromArgs(Array(propertiesFile, "--override", "a=b=c")))
-  }
-
-  @Test(expected = classOf[ExitCalled])
+  @Test(expected = classOf[FatalExitError])
   def testGetKafkaConfigFromArgsNonArgsAtTheEnd(): Unit = {
     val propertiesFile = prepareDefaultConfig()
     KafkaConfig.fromProps(Kafka.getPropsFromArgs(Array(propertiesFile, "--override", "broker.id=1", "broker.id=2")))
   }
 
-  @Test(expected = classOf[ExitCalled])
+  @Test(expected = classOf[FatalExitError])
   def testGetKafkaConfigFromArgsNonArgsOnly(): Unit = {
     val propertiesFile = prepareDefaultConfig()
     KafkaConfig.fromProps(Kafka.getPropsFromArgs(Array(propertiesFile, "broker.id=1", "broker.id=2")))
   }
 
-  @Test(expected = classOf[ExitCalled])
+  @Test(expected = classOf[FatalExitError])
   def testGetKafkaConfigFromArgsNonArgsAtTheBegging(): Unit = {
     val propertiesFile = prepareDefaultConfig()
     KafkaConfig.fromProps(Kafka.getPropsFromArgs(Array(propertiesFile, "broker.id=1", "--override", "broker.id=2")))
@@ -108,13 +83,45 @@ class KafkaTest {
     val config = KafkaConfig.fromProps(Kafka.getPropsFromArgs(Array(propertiesFile, "--override", "ssl.keystore.password=keystore_password",
                                                                                     "--override", "ssl.key.password=key_password",
                                                                                     "--override", "ssl.truststore.password=truststore_password")))
-    assertEquals(Password.HIDDEN, config.sslKeyPassword.toString)
-    assertEquals(Password.HIDDEN, config.sslKeystorePassword.toString)
-    assertEquals(Password.HIDDEN, config.sslTruststorePassword.toString)
+    assertEquals(Password.HIDDEN, config.getPassword(KafkaConfig.SslKeyPasswordProp).toString)
+    assertEquals(Password.HIDDEN, config.getPassword(KafkaConfig.SslKeystorePasswordProp).toString)
+    assertEquals(Password.HIDDEN, config.getPassword(KafkaConfig.SslTruststorePasswordProp).toString)
 
-    assertEquals("key_password", config.sslKeyPassword.value)
-    assertEquals("keystore_password", config.sslKeystorePassword.value)
-    assertEquals("truststore_password", config.sslTruststorePassword.value)
+    assertEquals("key_password", config.getPassword(KafkaConfig.SslKeyPasswordProp).value)
+    assertEquals("keystore_password", config.getPassword(KafkaConfig.SslKeystorePasswordProp).value)
+    assertEquals("truststore_password", config.getPassword(KafkaConfig.SslTruststorePasswordProp).value)
+  }
+
+  @Test
+  def testKafkaSslPasswordsWithSymbols(): Unit = {
+    val password = "=!#-+!?*/\"\'^%$=\\.,@:;="
+    val propertiesFile = prepareDefaultConfig()
+    val config = KafkaConfig.fromProps(Kafka.getPropsFromArgs(Array(propertiesFile,
+      "--override", "ssl.keystore.password=" + password,
+      "--override", "ssl.key.password=" + password,
+      "--override", "ssl.truststore.password=" + password)))
+    assertEquals(Password.HIDDEN, config.getPassword(KafkaConfig.SslKeyPasswordProp).toString)
+    assertEquals(Password.HIDDEN, config.getPassword(KafkaConfig.SslKeystorePasswordProp).toString)
+    assertEquals(Password.HIDDEN, config.getPassword(KafkaConfig.SslTruststorePasswordProp).toString)
+
+    assertEquals(password, config.getPassword(KafkaConfig.SslKeystorePasswordProp).value)
+    assertEquals(password, config.getPassword(KafkaConfig.SslKeyPasswordProp).value)
+    assertEquals(password, config.getPassword(KafkaConfig.SslTruststorePasswordProp).value)
+  }
+
+  @Test
+  def testConnectionsMaxReauthMsDefault(): Unit = {
+    val propertiesFile = prepareDefaultConfig()
+    val config = KafkaConfig.fromProps(Kafka.getPropsFromArgs(Array(propertiesFile)))
+    assertEquals(0L, config.valuesWithPrefixOverride("sasl_ssl.oauthbearer.").get(BrokerSecurityConfigs.CONNECTIONS_MAX_REAUTH_MS).asInstanceOf[Long])
+  }
+
+  @Test
+  def testConnectionsMaxReauthMsExplicit(): Unit = {
+    val propertiesFile = prepareDefaultConfig()
+    val expected = 3600000
+    val config = KafkaConfig.fromProps(Kafka.getPropsFromArgs(Array(propertiesFile, "--override", s"sasl_ssl.oauthbearer.connections.max.reauth.ms=${expected}")))
+    assertEquals(expected, config.valuesWithPrefixOverride("sasl_ssl.oauthbearer.").get(BrokerSecurityConfigs.CONNECTIONS_MAX_REAUTH_MS).asInstanceOf[Long])
   }
 
   def prepareDefaultConfig(): String = {
@@ -125,14 +132,13 @@ class KafkaTest {
     val file = File.createTempFile("kafkatest", ".properties")
     file.deleteOnExit()
 
-    val writer = new FileOutputStream(file)
-    lines.foreach { l =>
-      writer.write(l.getBytes)
-      writer.write("\n".getBytes)
-    }
-
-    writer.close
-
-    file.getAbsolutePath
+    val writer = Files.newOutputStream(file.toPath)
+    try {
+      lines.foreach { l =>
+        writer.write(l.getBytes)
+        writer.write("\n".getBytes)
+      }
+      file.getAbsolutePath
+    } finally writer.close()
   }
 }

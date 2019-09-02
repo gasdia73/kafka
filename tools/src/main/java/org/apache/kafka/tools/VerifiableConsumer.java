@@ -1,10 +1,10 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
+ * contributor license agreements. See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
  * The ASF licenses this file to You under the Apache License, Version 2.0
  * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
+ * the License. You may obtain a copy of the License at
  *
  *    http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -18,6 +18,7 @@ package org.apache.kafka.tools;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.annotation.JsonPropertyOrder;
 import com.fasterxml.jackson.core.JsonGenerator;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonSerializer;
@@ -38,16 +39,21 @@ import org.apache.kafka.clients.consumer.OffsetCommitCallback;
 import org.apache.kafka.clients.consumer.RangeAssignor;
 import org.apache.kafka.clients.consumer.RoundRobinAssignor;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.errors.FencedInstanceIdException;
 import org.apache.kafka.common.errors.WakeupException;
 import org.apache.kafka.common.serialization.StringDeserializer;
+import org.apache.kafka.common.utils.Exit;
 import org.apache.kafka.common.utils.Utils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.Closeable;
 import java.io.IOException;
 import java.io.PrintStream;
+import java.time.Duration;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -56,7 +62,6 @@ import java.util.concurrent.CountDownLatch;
 
 import static net.sourceforge.argparse4j.impl.Arguments.store;
 import static net.sourceforge.argparse4j.impl.Arguments.storeTrue;
-
 
 /**
  * Command line consumer designed for system testing. It outputs consumer events to STDOUT as JSON
@@ -79,6 +84,8 @@ import static net.sourceforge.argparse4j.impl.Arguments.storeTrue;
  * </ul>
  */
 public class VerifiableConsumer implements Closeable, OffsetCommitCallback, ConsumerRebalanceListener {
+
+    private static final Logger log = LoggerFactory.getLogger(VerifiableConsumer.class);
 
     private final ObjectMapper mapper = new ObjectMapper();
     private final PrintStream out;
@@ -208,6 +215,8 @@ public class VerifiableConsumer implements Closeable, OffsetCommitCallback, Cons
             // we only call wakeup() once to close the consumer, so this recursion should be safe
             commitSync(offsets);
             throw e;
+        } catch (FencedInstanceIdException e) {
+            throw e;
         } catch (Exception e) {
             onComplete(offsets, e);
         }
@@ -215,10 +224,11 @@ public class VerifiableConsumer implements Closeable, OffsetCommitCallback, Cons
 
     public void run() {
         try {
-            consumer.subscribe(Arrays.asList(topic), this);
+            printJson(new StartupComplete());
+            consumer.subscribe(Collections.singletonList(topic), this);
 
-            while (true) {
-                ConsumerRecords<String, String> records = consumer.poll(Long.MAX_VALUE);
+            while (!isFinished()) {
+                ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(Long.MAX_VALUE));
                 Map<TopicPartition, OffsetAndMetadata> offsets = onRecordsReceived(records);
 
                 if (!useAutoCommit) {
@@ -230,6 +240,10 @@ public class VerifiableConsumer implements Closeable, OffsetCommitCallback, Cons
             }
         } catch (WakeupException e) {
             // ignore, we are closing
+            log.trace("Caught WakeupException because consumer is shutdown, ignore and terminate.", e);
+        } catch (Throwable t) {
+            // Log the error so it goes to the service log and not stdout
+            log.error("Error during processing, terminating consumer process: ", t);
         } finally {
             consumer.close();
             printJson(new ShutdownComplete());
@@ -255,6 +269,7 @@ public class VerifiableConsumer implements Closeable, OffsetCommitCallback, Cons
         }
     }
 
+    @JsonPropertyOrder({ "timestamp", "name" })
     private static abstract class ConsumerEvent {
         private final long timestamp = System.currentTimeMillis();
 
@@ -264,6 +279,14 @@ public class VerifiableConsumer implements Closeable, OffsetCommitCallback, Cons
         @JsonProperty
         public long timestamp() {
             return timestamp;
+        }
+    }
+
+    private static class StartupComplete extends ConsumerEvent {
+
+        @Override
+        public String name() {
+            return "startup_complete";
         }
     }
 
@@ -336,6 +359,7 @@ public class VerifiableConsumer implements Closeable, OffsetCommitCallback, Cons
         }
     }
 
+    @JsonPropertyOrder({ "timestamp", "name", "key", "value", "topic", "partition", "offset" })
     public static class RecordData extends ConsumerEvent {
 
         private final ConsumerRecord<String, String> record;
@@ -503,6 +527,14 @@ public class VerifiableConsumer implements Closeable, OffsetCommitCallback, Cons
                 .dest("groupId")
                 .help("The groupId shared among members of the consumer group");
 
+        parser.addArgument("--group-instance-id")
+                .action(store())
+                .required(true)
+                .type(String.class)
+                .metavar("GROUP_INSTANCE_ID")
+                .dest("groupInstanceId")
+                .help("A unique identifier of the consumer instance");
+
         parser.addArgument("--max-messages")
                 .action(store())
                 .required(false)
@@ -579,6 +611,11 @@ public class VerifiableConsumer implements Closeable, OffsetCommitCallback, Cons
         }
 
         consumerProps.put(ConsumerConfig.GROUP_ID_CONFIG, res.getString("groupId"));
+
+        String groupInstanceId = res.getString("groupInstanceId");
+        if (!groupInstanceId.equals("None")) {
+            consumerProps.put(ConsumerConfig.GROUP_INSTANCE_ID_CONFIG, groupInstanceId);
+        }
         consumerProps.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, res.getString("brokerList"));
         consumerProps.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, useAutoCommit);
         consumerProps.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, res.getString("resetPolicy"));
@@ -602,22 +639,17 @@ public class VerifiableConsumer implements Closeable, OffsetCommitCallback, Cons
         ArgumentParser parser = argParser();
         if (args.length == 0) {
             parser.printHelp();
-            System.exit(0);
+            Exit.exit(0);
         }
 
         try {
             final VerifiableConsumer consumer = createFromArgs(parser, args);
-            Runtime.getRuntime().addShutdownHook(new Thread() {
-                @Override
-                public void run() {
-                    consumer.close();
-                }
-            });
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> consumer.close()));
 
             consumer.run();
         } catch (ArgumentParserException e) {
             parser.handleError(e);
-            System.exit(1);
+            Exit.exit(1);
         }
     }
 

@@ -1,10 +1,10 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
+ * contributor license agreements. See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
  * The ASF licenses this file to You under the Apache License, Version 2.0
  * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
+ * the License. You may obtain a copy of the License at
  *
  *    http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -14,39 +14,62 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.kafka.streams.processor.internals;
 
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.common.TopicPartition;
-import org.apache.kafka.common.record.TimestampType;
+import org.apache.kafka.common.metrics.Sensor;
+import org.apache.kafka.common.utils.LogContext;
+import org.apache.kafka.streams.errors.DeserializationExceptionHandler;
 import org.apache.kafka.streams.errors.StreamsException;
+import org.apache.kafka.streams.processor.ProcessorContext;
 import org.apache.kafka.streams.processor.TimestampExtractor;
+import org.apache.kafka.streams.processor.internals.metrics.ThreadMetrics;
+import org.slf4j.Logger;
 
 import java.util.ArrayDeque;
 
-import static java.lang.String.format;
-
 /**
  * RecordQueue is a FIFO queue of {@link StampedRecord} (ConsumerRecord + timestamp). It also keeps track of the
- * partition timestamp defined as the minimum timestamp of records in its queue; in addition, its partition
- * timestamp is monotonically increasing such that once it is advanced, it will not be decremented.
+ * partition timestamp defined as the largest timestamp seen on the partition so far; this is passed to the
+ * timestamp extractor.
  */
 public class RecordQueue {
 
+    public static final long UNKNOWN = ConsumerRecord.NO_TIMESTAMP;
+
+    private final Logger log;
     private final SourceNode source;
     private final TopicPartition partition;
-    private final ArrayDeque<StampedRecord> fifoQueue;
-    private final TimestampTracker<ConsumerRecord<Object, Object>> timeTracker;
+    private final ProcessorContext processorContext;
+    private final TimestampExtractor timestampExtractor;
+    private final RecordDeserializer recordDeserializer;
+    private final ArrayDeque<ConsumerRecord<byte[], byte[]>> fifoQueue;
 
-    private long partitionTime = TimestampTracker.NOT_KNOWN;
+    private StampedRecord headRecord = null;
+    private long partitionTime = RecordQueue.UNKNOWN;
 
-    public RecordQueue(TopicPartition partition, SourceNode source) {
-        this.partition = partition;
+    private Sensor skipRecordsSensor;
+
+    RecordQueue(final TopicPartition partition,
+                final SourceNode source,
+                final TimestampExtractor timestampExtractor,
+                final DeserializationExceptionHandler deserializationExceptionHandler,
+                final InternalProcessorContext processorContext,
+                final LogContext logContext) {
         this.source = source;
-
+        this.partition = partition;
         this.fifoQueue = new ArrayDeque<>();
-        this.timeTracker = new MinTimestampTracker<>();
+        this.timestampExtractor = timestampExtractor;
+        this.processorContext = processorContext;
+        skipRecordsSensor = ThreadMetrics.skipRecordSensor(processorContext.metrics());
+        recordDeserializer = new RecordDeserializer(
+            source,
+            deserializationExceptionHandler,
+            logContext,
+            skipRecordsSensor
+        );
+        this.log = logContext.logger(RecordQueue.class);
     }
 
     /**
@@ -71,52 +94,14 @@ public class RecordQueue {
      * Add a batch of {@link ConsumerRecord} into the queue
      *
      * @param rawRecords the raw records
-     * @param timestampExtractor TimestampExtractor
      * @return the size of this queue
      */
-    public int addRawRecords(Iterable<ConsumerRecord<byte[], byte[]>> rawRecords, TimestampExtractor timestampExtractor) {
-        for (ConsumerRecord<byte[], byte[]> rawRecord : rawRecords) {
-            // deserialize the raw record, extract the timestamp and put into the queue
-            final Object key;
-            try {
-                key = source.deserializeKey(rawRecord.topic(), rawRecord.key());
-            } catch (Exception e) {
-                throw new StreamsException(format("Failed to deserialize key for record. topic=%s, partition=%d, offset=%d",
-                                                  rawRecord.topic(), rawRecord.partition(), rawRecord.offset()), e);
-            }
-
-            final Object value;
-            try {
-                value = source.deserializeValue(rawRecord.topic(), rawRecord.value());
-            } catch (Exception e) {
-                throw new StreamsException(format("Failed to deserialize value for record. topic=%s, partition=%d, offset=%d",
-                                                  rawRecord.topic(), rawRecord.partition(), rawRecord.offset()), e);
-            }
-
-            ConsumerRecord<Object, Object> record = new ConsumerRecord<>(rawRecord.topic(), rawRecord.partition(), rawRecord.offset(),
-                                                                         rawRecord.timestamp(), TimestampType.CREATE_TIME,
-                                                                         rawRecord.checksum(),
-                                                                         rawRecord.serializedKeySize(),
-                                                                         rawRecord.serializedValueSize(), key, value);
-            long timestamp = timestampExtractor.extract(record);
-
-            // validate that timestamp must be non-negative
-            if (timestamp < 0)
-                throw new StreamsException("Extracted timestamp value is negative, which is not allowed.");
-
-            StampedRecord stampedRecord = new StampedRecord(record, timestamp);
-
-            fifoQueue.addLast(stampedRecord);
-            timeTracker.addElement(stampedRecord);
+    int addRawRecords(final Iterable<ConsumerRecord<byte[], byte[]>> rawRecords) {
+        for (final ConsumerRecord<byte[], byte[]> rawRecord : rawRecords) {
+            fifoQueue.addLast(rawRecord);
         }
 
-        // update the partition timestamp if its currently
-        // tracked min timestamp has exceed its value; this will
-        // usually only take effect for the first added batch
-        long timestamp = timeTracker.get();
-
-        if (timestamp > partitionTime)
-            partitionTime = timestamp;
+        updateHead();
 
         return size();
     }
@@ -127,21 +112,12 @@ public class RecordQueue {
      * @return StampedRecord
      */
     public StampedRecord poll() {
-        StampedRecord elem = fifoQueue.pollFirst();
+        final StampedRecord recordToReturn = headRecord;
+        headRecord = null;
 
-        if (elem == null)
-            return null;
+        updateHead();
 
-        timeTracker.removeElement(elem);
-
-        // only advance the partition timestamp if its currently
-        // tracked min timestamp has exceeded its value
-        long timestamp = timeTracker.get();
-
-        if (timestamp > partitionTime)
-            partitionTime = timestamp;
-
-        return elem;
+        return recordToReturn;
     }
 
     /**
@@ -150,7 +126,8 @@ public class RecordQueue {
      * @return the number of records
      */
     public int size() {
-        return fifoQueue.size();
+        // plus one deserialized head record for timestamp tracking
+        return fifoQueue.size() + (headRecord == null ? 0 : 1);
     }
 
     /**
@@ -159,15 +136,72 @@ public class RecordQueue {
      * @return true if the queue is empty, otherwise false
      */
     public boolean isEmpty() {
-        return fifoQueue.isEmpty();
+        return fifoQueue.isEmpty() && headRecord == null;
     }
 
     /**
-     * Returns the tracked partition timestamp
+     * Returns the head record's timestamp
      *
      * @return timestamp
      */
-    public long timestamp() {
+    public long headRecordTimestamp() {
+        return headRecord == null ? UNKNOWN : headRecord.timestamp;
+    }
+
+    /**
+     * Returns the tracked partition time
+     *
+     * @return partition time
+     */
+    long partitionTime() {
         return partitionTime;
+    }
+
+    /**
+     * Clear the fifo queue of its elements, also clear the time tracker's kept stamped elements
+     */
+    public void clear() {
+        fifoQueue.clear();
+        headRecord = null;
+        partitionTime = RecordQueue.UNKNOWN;
+    }
+
+    private void updateHead() {
+        while (headRecord == null && !fifoQueue.isEmpty()) {
+            final ConsumerRecord<byte[], byte[]> raw = fifoQueue.pollFirst();
+            final ConsumerRecord<Object, Object> deserialized = recordDeserializer.deserialize(processorContext, raw);
+
+            if (deserialized == null) {
+                // this only happens if the deserializer decides to skip. It has already logged the reason.
+                continue;
+            }
+
+            final long timestamp;
+            try {
+                timestamp = timestampExtractor.extract(deserialized, partitionTime);
+            } catch (final StreamsException internalFatalExtractorException) {
+                throw internalFatalExtractorException;
+            } catch (final Exception fatalUserException) {
+                throw new StreamsException(
+                        String.format("Fatal user code error in TimestampExtractor callback for record %s.", deserialized),
+                        fatalUserException);
+            }
+            log.trace("Source node {} extracted timestamp {} for record {}", source.name(), timestamp, deserialized);
+
+            // drop message if TS is invalid, i.e., negative
+            if (timestamp < 0) {
+                log.warn(
+                        "Skipping record due to negative extracted timestamp. topic=[{}] partition=[{}] offset=[{}] extractedTimestamp=[{}] extractor=[{}]",
+                        deserialized.topic(), deserialized.partition(), deserialized.offset(), timestamp, timestampExtractor.getClass().getCanonicalName()
+                );
+
+                skipRecordsSensor.record();
+                continue;
+            }
+
+            headRecord = new StampedRecord(deserialized, timestamp);
+
+            partitionTime = Math.max(partitionTime, timestamp);
+        }
     }
 }

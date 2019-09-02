@@ -1,12 +1,12 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
+ * contributor license agreements. See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
  * The ASF licenses this file to You under the Apache License, Version 2.0
  * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
+ * the License. You may obtain a copy of the License at
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ *    http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -16,75 +16,76 @@
  */
 package org.apache.kafka.common.requests;
 
+import org.apache.kafka.common.message.DeleteTopicsRequestData;
+import org.apache.kafka.common.message.DeleteTopicsResponseData;
+import org.apache.kafka.common.message.DeleteTopicsResponseData.DeletableTopicResult;
 import org.apache.kafka.common.protocol.ApiKeys;
-import org.apache.kafka.common.protocol.Errors;
-import org.apache.kafka.common.protocol.ProtoUtils;
-import org.apache.kafka.common.protocol.types.Schema;
 import org.apache.kafka.common.protocol.types.Struct;
 
 import java.nio.ByteBuffer;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.Map;
-import java.util.Set;
 
 public class DeleteTopicsRequest extends AbstractRequest {
-    private static final Schema CURRENT_SCHEMA = ProtoUtils.currentRequestSchema(ApiKeys.DELETE_TOPICS.id);
-    private static final String TOPICS_KEY_NAME = "topics";
-    private static final String TIMEOUT_KEY_NAME = "timeout";
 
-    private final Set<String> topics;
-    private final Integer timeout;
+    private DeleteTopicsRequestData data;
+    private final short version;
 
-    public DeleteTopicsRequest(Set<String> topics, Integer timeout) {
-        super(new Struct(CURRENT_SCHEMA));
+    public static class Builder extends AbstractRequest.Builder<DeleteTopicsRequest> {
+        private DeleteTopicsRequestData data;
 
-        struct.set(TOPICS_KEY_NAME, topics.toArray());
-        struct.set(TIMEOUT_KEY_NAME, timeout);
+        public Builder(DeleteTopicsRequestData data) {
+            super(ApiKeys.DELETE_TOPICS);
+            this.data = data;
+        }
 
-        this.topics = topics;
-        this.timeout = timeout;
-    }
+        @Override
+        public DeleteTopicsRequest build(short version) {
+            return new DeleteTopicsRequest(data, version);
+        }
 
-    public DeleteTopicsRequest(Struct struct) {
-        super(struct);
-        Object[] topicsArray = struct.getArray(TOPICS_KEY_NAME);
-        Set<String> topics = new HashSet<>(topicsArray.length);
-        for (Object topic : topicsArray)
-            topics.add((String) topic);
-
-        this.topics = topics;
-        this.timeout = struct.getInt(TIMEOUT_KEY_NAME);
-    }
-
-    @Override
-    public AbstractRequestResponse getErrorResponse(int versionId, Throwable e) {
-        Map<String, Errors> topicErrors = new HashMap<>();
-        for (String topic : topics)
-            topicErrors.put(topic, Errors.forException(e));
-
-        switch (versionId) {
-            case 0:
-                return new DeleteTopicsResponse(topicErrors);
-            default:
-                throw new IllegalArgumentException(String.format("Version %d is not valid. Valid versions for %s are 0 to %d",
-                    versionId, this.getClass().getSimpleName(), ProtoUtils.latestVersion(ApiKeys.DELETE_TOPICS.id)));
+        @Override
+        public String toString() {
+            return data.toString();
         }
     }
 
-    public Set<String> topics() {
-        return topics;
+    private DeleteTopicsRequest(DeleteTopicsRequestData data, short version) {
+        super(ApiKeys.DELETE_TOPICS, version);
+        this.data = data;
+        this.version = version;
     }
 
-    public Integer timeout() {
-        return this.timeout;
+    public DeleteTopicsRequest(Struct struct, short version) {
+        super(ApiKeys.DELETE_TOPICS, version);
+        this.data = new DeleteTopicsRequestData(struct, version);
+        this.version = version;
     }
 
-    public static DeleteTopicsRequest parse(ByteBuffer buffer, int versionId) {
-        return new DeleteTopicsRequest(ProtoUtils.parseRequest(ApiKeys.DELETE_TOPICS.id, versionId, buffer));
+    @Override
+    protected Struct toStruct() {
+        return data.toStruct(version);
     }
 
-    public static DeleteTopicsRequest parse(ByteBuffer buffer) {
-        return new DeleteTopicsRequest(CURRENT_SCHEMA.read(buffer));
+    public DeleteTopicsRequestData data() {
+        return data;
     }
+
+    @Override
+    public AbstractResponse getErrorResponse(int throttleTimeMs, Throwable e) {
+        DeleteTopicsResponseData response = new DeleteTopicsResponseData();
+        if (version >= 1) {
+            response.setThrottleTimeMs(throttleTimeMs);
+        }
+        ApiError apiError = ApiError.fromThrowable(e);
+        for (String topic : data.topicNames()) {
+            response.responses().add(new DeletableTopicResult()
+                    .setName(topic)
+                    .setErrorCode(apiError.error().code()));
+        }
+        return new DeleteTopicsResponse(response);
+    }
+
+    public static DeleteTopicsRequest parse(ByteBuffer buffer, short version) {
+        return new DeleteTopicsRequest(ApiKeys.DELETE_TOPICS.parseRequest(version, buffer), version);
+    }
+
 }

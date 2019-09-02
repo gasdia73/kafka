@@ -13,32 +13,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from ducktape.cluster.remoteaccount import RemoteCommandError
 from ducktape.mark import parametrize
+from ducktape.mark.resource import cluster
+from ducktape.utils.util import wait_until
+from ducktape.errors import TimeoutError
 
-from kafkatest.services.zookeeper import ZookeeperService
-from kafkatest.services.kafka import KafkaService
-from kafkatest.services.verifiable_producer import VerifiableProducer
-from kafkatest.services.console_consumer import ConsoleConsumer
 from kafkatest.services.security.security_config import SecurityConfig
 from kafkatest.services.security.security_config import SslStores
-from kafkatest.tests.produce_consume_validate import ProduceConsumeValidateTest
-from kafkatest.utils import is_int
-import time
+from kafkatest.tests.end_to_end import EndToEndTest
 
 class TestSslStores(SslStores):
-    def __init__(self):
-        super(TestSslStores, self).__init__()
-        self.invalid_hostname = False
+    def __init__(self, local_scratch_dir, valid_hostname=True):
+        super(TestSslStores, self).__init__(local_scratch_dir)
+        self.valid_hostname = valid_hostname
         self.generate_ca()
         self.generate_truststore()
 
     def hostname(self, node):
-        if (self.invalid_hostname):
-            return "invalidhost"
-        else:
+        if self.valid_hostname:
             return super(TestSslStores, self).hostname(node)
+        else:
+            return "invalidhostname"
 
-class SecurityTest(ProduceConsumeValidateTest):
+class SecurityTest(EndToEndTest):
     """
     These tests validate security features.
     """
@@ -47,21 +45,18 @@ class SecurityTest(ProduceConsumeValidateTest):
         """:type test_context: ducktape.tests.test.TestContext"""
         super(SecurityTest, self).__init__(test_context=test_context)
 
-        self.topic = "test_topic"
-        self.zk = ZookeeperService(test_context, num_nodes=1)
-        self.kafka = KafkaService(test_context, num_nodes=1, zk=self.zk, topics={self.topic: {
-                                                                    "partitions": 2,
-                                                                    "replication-factor": 1}
-                                                                })
-        self.num_partitions = 2
-        self.timeout_sec = 10000
-        self.producer_throughput = 1000
-        self.num_producers = 1
-        self.num_consumers = 1
+    def producer_consumer_have_expected_error(self, error):
+        try:
+            for node in self.producer.nodes:
+                node.account.ssh("grep %s %s" % (error, self.producer.LOG_FILE))
+            for node in self.consumer.nodes:
+                node.account.ssh("grep %s %s" % (error, self.consumer.LOG_FILE))
+        except RemoteCommandError:
+            return False
 
-    def setUp(self):
-        self.zk.start()
+        return True
 
+    @cluster(num_nodes=7)
     @parametrize(security_protocol='PLAINTEXT', interbroker_security_protocol='SSL')
     @parametrize(security_protocol='SSL', interbroker_security_protocol='PLAINTEXT')
     def test_client_ssl_endpoint_validation_failure(self, security_protocol, interbroker_security_protocol):
@@ -72,35 +67,42 @@ class SecurityTest(ProduceConsumeValidateTest):
         with hostname verification failure. Hence clients are expected to fail with LEADER_NOT_AVAILABLE.
         """
 
-        self.kafka.security_protocol = security_protocol
-        self.kafka.interbroker_security_protocol = interbroker_security_protocol
-        SecurityConfig.ssl_stores = TestSslStores()
+        SecurityConfig.ssl_stores = TestSslStores(self.test_context.local_scratch_dir,
+                                                  valid_hostname=False)
 
-        SecurityConfig.ssl_stores.invalid_hostname = True
+        self.create_zookeeper()
+        self.zk.start()
+
+        self.create_kafka(security_protocol=security_protocol,
+                          interbroker_security_protocol=interbroker_security_protocol)
         self.kafka.start()
-        self.create_producer_and_consumer()
-        self.producer.log_level = "TRACE"
-        self.producer.start()
-        self.consumer.start()
-        time.sleep(10)
-        assert self.producer.num_acked == 0, "Messages published successfully, endpoint validation did not fail with invalid hostname"
-        error = 'SSLHandshakeException' if security_protocol is 'SSL' else 'LEADER_NOT_AVAILABLE'
-        for node in self.producer.nodes:
-            node.account.ssh("grep %s %s" % (error, self.producer.LOG_FILE))
-        for node in self.consumer.nodes:
-            node.account.ssh("grep %s %s" % (error, self.consumer.LOG_FILE))
 
+        # We need more verbose logging to catch the expected errors
+        self.create_and_start_clients(log_level="DEBUG")
+
+        try:
+            wait_until(lambda: self.producer.num_acked > 0, timeout_sec=30)
+
+            # Fail quickly if messages are successfully acked
+            raise RuntimeError("Messages published successfully but should not have!"
+                               " Endpoint validation did not fail with invalid hostname")
+        except TimeoutError:
+            # expected
+            pass
+
+        error = 'SSLHandshakeException' if security_protocol == 'SSL' else 'LEADER_NOT_AVAILABLE'
+        wait_until(lambda: self.producer_consumer_have_expected_error(error), timeout_sec=30)
         self.producer.stop()
         self.consumer.stop()
-        self.producer.log_level = "INFO"
 
-        SecurityConfig.ssl_stores.invalid_hostname = False
-        for node in self.kafka.nodes:
-            self.kafka.restart_node(node, clean_shutdown=True)
-        self.create_producer_and_consumer()
-        self.run_produce_consume_validate()
+        SecurityConfig.ssl_stores.valid_hostname = True
+        self.kafka.restart_cluster()
+        self.create_and_start_clients(log_level="INFO")
+        self.run_validation()
 
-    def create_producer_and_consumer(self):
-        self.producer = VerifiableProducer(self.test_context, self.num_producers, self.kafka, self.topic, throughput=self.producer_throughput)
-        self.consumer = ConsoleConsumer(self.test_context, self.num_consumers, self.kafka, self.topic, new_consumer=True, consumer_timeout_ms=10000, message_validator=is_int)
+    def create_and_start_clients(self, log_level):
+        self.create_producer(log_level=log_level)
+        self.producer.start()
 
+        self.create_consumer(log_level=log_level)
+        self.consumer.start()

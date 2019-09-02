@@ -25,9 +25,10 @@ import org.apache.kafka.common.utils.Utils
 
 trait OffsetMap {
   def slots: Int
-  def put(key: ByteBuffer, offset: Long)
+  def put(key: ByteBuffer, offset: Long): Unit
   def get(key: ByteBuffer): Long
-  def clear()
+  def updateLatestOffset(offset: Long): Unit
+  def clear(): Unit
   def size: Int
   def utilization: Double = size.toDouble / slots
   def latestOffset: Long
@@ -80,7 +81,7 @@ class SkimpyOffsetMap(val memory: Int, val hashAlgorithm: String = "MD5") extend
    * @param key The key
    * @param offset The offset
    */
-  override def put(key: ByteBuffer, offset: Long) {
+  override def put(key: ByteBuffer, offset: Long): Unit = {
     require(entries < slots, "Attempt to add a new entry to a full offset map.")
     lookups += 1
     hashInto(key, hash1)
@@ -143,12 +144,12 @@ class SkimpyOffsetMap(val memory: Int, val hashAlgorithm: String = "MD5") extend
   /**
    * Change the salt used for key hashing making all existing keys unfindable.
    */
-  override def clear() {
+  override def clear(): Unit = {
     this.entries = 0
     this.lookups = 0L
     this.probes = 0L
     this.lastOffset = -1L
-    Arrays.fill(bytes.array, bytes.arrayOffset, bytes.arrayOffset + bytes.limit, 0.toByte)
+    Arrays.fill(bytes.array, bytes.arrayOffset, bytes.arrayOffset + bytes.limit(), 0.toByte)
   }
   
   /**
@@ -166,6 +167,10 @@ class SkimpyOffsetMap(val memory: Int, val hashAlgorithm: String = "MD5") extend
    * The latest offset put into the map
    */
   override def latestOffset: Long = lastOffset
+
+  override def updateLatestOffset(offset: Long): Unit = {
+    lastOffset = offset
+  }
 
   /**
    * Calculate the ith probe position. We first try reading successive integers from the hash itself
@@ -186,7 +191,7 @@ class SkimpyOffsetMap(val memory: Int, val hashAlgorithm: String = "MD5") extend
    * @param key The key to hash
    * @param buffer The buffer to store the hash into
    */
-  private def hashInto(key: ByteBuffer, buffer: Array[Byte]) {
+  private def hashInto(key: ByteBuffer, buffer: Array[Byte]): Unit = {
     key.mark()
     digest.update(key)
     key.reset()

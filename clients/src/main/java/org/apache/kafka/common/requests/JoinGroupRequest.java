@@ -1,195 +1,161 @@
-/**
- * Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements. See the NOTICE
- * file distributed with this work for additional information regarding copyright ownership. The ASF licenses this file
- * to You under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the
- * License. You may obtain a copy of the License at
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *    http://www.apache.org/licenses/LICENSE-2.0
  *
- * Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on
- * an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the
- * specific language governing permissions and limitations under the License.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package org.apache.kafka.common.requests;
 
+import org.apache.kafka.common.errors.InvalidConfigurationException;
+import org.apache.kafka.common.errors.UnsupportedVersionException;
+import org.apache.kafka.common.message.JoinGroupRequestData;
+import org.apache.kafka.common.message.JoinGroupResponseData;
 import org.apache.kafka.common.protocol.ApiKeys;
 import org.apache.kafka.common.protocol.Errors;
-import org.apache.kafka.common.protocol.ProtoUtils;
-import org.apache.kafka.common.protocol.types.Schema;
 import org.apache.kafka.common.protocol.types.Struct;
 
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
 import java.util.Collections;
-import java.util.List;
 
 public class JoinGroupRequest extends AbstractRequest {
 
-    private static final Schema CURRENT_SCHEMA = ProtoUtils.currentRequestSchema(ApiKeys.JOIN_GROUP.id);
-    private static final String GROUP_ID_KEY_NAME = "group_id";
-    private static final String SESSION_TIMEOUT_KEY_NAME = "session_timeout";
-    private static final String REBALANCE_TIMEOUT_KEY_NAME = "rebalance_timeout";
-    private static final String MEMBER_ID_KEY_NAME = "member_id";
-    private static final String PROTOCOL_TYPE_KEY_NAME = "protocol_type";
-    private static final String GROUP_PROTOCOLS_KEY_NAME = "group_protocols";
-    private static final String PROTOCOL_NAME_KEY_NAME = "protocol_name";
-    private static final String PROTOCOL_METADATA_KEY_NAME = "protocol_metadata";
+    public static class Builder extends AbstractRequest.Builder<JoinGroupRequest> {
+
+        private final JoinGroupRequestData data;
+
+        public Builder(JoinGroupRequestData data) {
+            super(ApiKeys.JOIN_GROUP);
+            this.data = data;
+        }
+
+        @Override
+        public JoinGroupRequest build(short version) {
+            if (data.groupInstanceId() != null && version < 5) {
+                throw new UnsupportedVersionException("The broker join group protocol version " +
+                        version + " does not support usage of config group.instance.id.");
+            }
+            return new JoinGroupRequest(data, version);
+        }
+
+        @Override
+        public String toString() {
+            return data.toString();
+        }
+    }
+
+    private final JoinGroupRequestData data;
 
     public static final String UNKNOWN_MEMBER_ID = "";
 
-    private final String groupId;
-    private final int sessionTimeout;
-    private final int rebalanceTimeout;
-    private final String memberId;
-    private final String protocolType;
-    private final List<ProtocolMetadata> groupProtocols;
+    private static final int MAX_GROUP_INSTANCE_ID_LENGTH = 249;
 
-    public static class ProtocolMetadata {
-        private final String name;
-        private final ByteBuffer metadata;
+    /**
+     * Ported from class Topic in {@link org.apache.kafka.common.internals} to restrict the charset for
+     * static member id.
+     */
+    public static void validateGroupInstanceId(String id) {
+        if (id.equals(""))
+            throw new InvalidConfigurationException("Group instance id must be non-empty string");
+        if (id.equals(".") || id.equals(".."))
+            throw new InvalidConfigurationException("Group instance id cannot be \".\" or \"..\"");
+        if (id.length() > MAX_GROUP_INSTANCE_ID_LENGTH)
+            throw new InvalidConfigurationException("Group instance id can't be longer than " + MAX_GROUP_INSTANCE_ID_LENGTH +
+                    " characters: " + id);
+        if (!containsValidPattern(id))
+            throw new InvalidConfigurationException("Group instance id \"" + id + "\" is illegal, it contains a character other than " +
+                    "ASCII alphanumerics, '.', '_' and '-'");
+    }
 
-        public ProtocolMetadata(String name, ByteBuffer metadata) {
-            this.name = name;
-            this.metadata = metadata;
+    /**
+     * Valid characters for Consumer group.instance.id are the ASCII alphanumerics, '.', '_', and '-'
+     */
+    static boolean containsValidPattern(String topic) {
+        for (int i = 0; i < topic.length(); ++i) {
+            char c = topic.charAt(i);
+
+            boolean validChar = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || c == '.' ||
+                    c == '_' || c == '-';
+            if (!validChar)
+                return false;
         }
+        return true;
+    }
 
-        public String name() {
-            return name;
-        }
+    public JoinGroupRequest(JoinGroupRequestData data, short version) {
+        super(ApiKeys.JOIN_GROUP, version);
+        this.data = data;
+        maybeOverrideRebalanceTimeout(version);
+    }
 
-        public ByteBuffer metadata() {
-            return metadata;
+    public JoinGroupRequest(Struct struct, short version) {
+        super(ApiKeys.JOIN_GROUP, version);
+        this.data = new JoinGroupRequestData(struct, version);
+        maybeOverrideRebalanceTimeout(version);
+    }
+
+    private void maybeOverrideRebalanceTimeout(short version) {
+        if (version == 0) {
+            // Version 0 has no rebalance timeout, so we use the session timeout
+            // to be consistent with the original behavior of the API.
+            data.setRebalanceTimeoutMs(data.sessionTimeoutMs());
         }
     }
 
-    // v0 constructor
-    @Deprecated
-    public JoinGroupRequest(String groupId,
-                            int sessionTimeout,
-                            String memberId,
-                            String protocolType,
-                            List<ProtocolMetadata> groupProtocols) {
-        this(0, groupId, sessionTimeout, sessionTimeout, memberId, protocolType, groupProtocols);
-    }
-
-    public JoinGroupRequest(String groupId,
-                            int sessionTimeout,
-                            int rebalanceTimeout,
-                            String memberId,
-                            String protocolType,
-                            List<ProtocolMetadata> groupProtocols) {
-        this(1, groupId, sessionTimeout, rebalanceTimeout, memberId, protocolType, groupProtocols);
-    }
-
-    private JoinGroupRequest(int version,
-                             String groupId,
-                             int sessionTimeout,
-                             int rebalanceTimeout,
-                             String memberId,
-                             String protocolType,
-                             List<ProtocolMetadata> groupProtocols) {
-        super(new Struct(ProtoUtils.requestSchema(ApiKeys.JOIN_GROUP.id, version)));
-
-        struct.set(GROUP_ID_KEY_NAME, groupId);
-        struct.set(SESSION_TIMEOUT_KEY_NAME, sessionTimeout);
-
-        if (version >= 1)
-            struct.set(REBALANCE_TIMEOUT_KEY_NAME, rebalanceTimeout);
-
-        struct.set(MEMBER_ID_KEY_NAME, memberId);
-        struct.set(PROTOCOL_TYPE_KEY_NAME, protocolType);
-
-        List<Struct> groupProtocolsList = new ArrayList<>();
-        for (ProtocolMetadata protocol : groupProtocols) {
-            Struct protocolStruct = struct.instance(GROUP_PROTOCOLS_KEY_NAME);
-            protocolStruct.set(PROTOCOL_NAME_KEY_NAME, protocol.name);
-            protocolStruct.set(PROTOCOL_METADATA_KEY_NAME, protocol.metadata);
-            groupProtocolsList.add(protocolStruct);
-        }
-
-        struct.set(GROUP_PROTOCOLS_KEY_NAME, groupProtocolsList.toArray());
-        this.groupId = groupId;
-        this.sessionTimeout = sessionTimeout;
-        this.rebalanceTimeout = rebalanceTimeout;
-        this.memberId = memberId;
-        this.protocolType = protocolType;
-        this.groupProtocols = groupProtocols;
-    }
-
-    public JoinGroupRequest(Struct struct) {
-        super(struct);
-
-        groupId = struct.getString(GROUP_ID_KEY_NAME);
-        sessionTimeout = struct.getInt(SESSION_TIMEOUT_KEY_NAME);
-
-        if (struct.hasField(REBALANCE_TIMEOUT_KEY_NAME))
-            // rebalance timeout is added in v1
-            rebalanceTimeout = struct.getInt(REBALANCE_TIMEOUT_KEY_NAME);
-        else
-            // v0 had no rebalance timeout but used session timeout implicitly
-            rebalanceTimeout = sessionTimeout;
-
-        memberId = struct.getString(MEMBER_ID_KEY_NAME);
-        protocolType = struct.getString(PROTOCOL_TYPE_KEY_NAME);
-
-        groupProtocols = new ArrayList<>();
-        for (Object groupProtocolObj : struct.getArray(GROUP_PROTOCOLS_KEY_NAME)) {
-            Struct groupProtocolStruct = (Struct) groupProtocolObj;
-            String name = groupProtocolStruct.getString(PROTOCOL_NAME_KEY_NAME);
-            ByteBuffer metadata = groupProtocolStruct.getBytes(PROTOCOL_METADATA_KEY_NAME);
-            groupProtocols.add(new ProtocolMetadata(name, metadata));
-        }
+    public JoinGroupRequestData data() {
+        return data;
     }
 
     @Override
-    public AbstractRequestResponse getErrorResponse(int versionId, Throwable e) {
+    public AbstractResponse getErrorResponse(int throttleTimeMs, Throwable e) {
+        short versionId = version();
         switch (versionId) {
             case 0:
             case 1:
                 return new JoinGroupResponse(
-                        versionId,
-                        Errors.forException(e).code(),
-                        JoinGroupResponse.UNKNOWN_GENERATION_ID,
-                        JoinGroupResponse.UNKNOWN_PROTOCOL,
-                        JoinGroupResponse.UNKNOWN_MEMBER_ID, // memberId
-                        JoinGroupResponse.UNKNOWN_MEMBER_ID, // leaderId
-                        Collections.<String, ByteBuffer>emptyMap());
-
+                        new JoinGroupResponseData()
+                                .setErrorCode(Errors.forException(e).code())
+                                .setGenerationId(JoinGroupResponse.UNKNOWN_GENERATION_ID)
+                                .setProtocolName(JoinGroupResponse.UNKNOWN_PROTOCOL)
+                                .setLeader(JoinGroupResponse.UNKNOWN_MEMBER_ID)
+                                .setMemberId(JoinGroupResponse.UNKNOWN_MEMBER_ID)
+                                .setMembers(Collections.emptyList())
+                );
+            case 2:
+            case 3:
+            case 4:
+            case 5:
+                return new JoinGroupResponse(
+                        new JoinGroupResponseData()
+                                .setThrottleTimeMs(throttleTimeMs)
+                                .setErrorCode(Errors.forException(e).code())
+                                .setGenerationId(JoinGroupResponse.UNKNOWN_GENERATION_ID)
+                                .setProtocolName(JoinGroupResponse.UNKNOWN_PROTOCOL)
+                                .setLeader(JoinGroupResponse.UNKNOWN_MEMBER_ID)
+                                .setMemberId(JoinGroupResponse.UNKNOWN_MEMBER_ID)
+                                .setMembers(Collections.emptyList())
+                );
             default:
                 throw new IllegalArgumentException(String.format("Version %d is not valid. Valid versions for %s are 0 to %d",
-                        versionId, this.getClass().getSimpleName(), ProtoUtils.latestVersion(ApiKeys.JOIN_GROUP.id)));
+                        versionId, this.getClass().getSimpleName(), ApiKeys.JOIN_GROUP.latestVersion()));
         }
     }
 
-    public String groupId() {
-        return groupId;
+    public static JoinGroupRequest parse(ByteBuffer buffer, short version) {
+        return new JoinGroupRequest(ApiKeys.JOIN_GROUP.parseRequest(version, buffer), version);
     }
 
-    public int sessionTimeout() {
-        return sessionTimeout;
-    }
-
-    public int rebalanceTimeout() {
-        return rebalanceTimeout;
-    }
-
-    public String memberId() {
-        return memberId;
-    }
-
-    public List<ProtocolMetadata> groupProtocols() {
-        return groupProtocols;
-    }
-
-    public String protocolType() {
-        return protocolType;
-    }
-
-    public static JoinGroupRequest parse(ByteBuffer buffer, int versionId) {
-        return new JoinGroupRequest(ProtoUtils.parseRequest(ApiKeys.JOIN_GROUP.id, versionId, buffer));
-    }
-
-    public static JoinGroupRequest parse(ByteBuffer buffer) {
-        return new JoinGroupRequest(CURRENT_SCHEMA.read(buffer));
+    @Override
+    protected Struct toStruct() {
+        return data.toStruct(version());
     }
 }

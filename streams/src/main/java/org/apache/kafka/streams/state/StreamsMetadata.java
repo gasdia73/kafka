@@ -1,13 +1,13 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
+ * contributor license agreements. See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
  * The ASF licenses this file to You under the Apache License, Version 2.0
  * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
- * <p>
- * http://www.apache.org/licenses/LICENSE-2.0
- * <p>
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -35,8 +35,8 @@ public class StreamsMetadata {
      * operations.
      */
     public final static StreamsMetadata NOT_AVAILABLE = new StreamsMetadata(new HostInfo("unavailable", -1),
-                                                                            Collections.<String>emptySet(),
-                                                                            Collections.<TopicPartition>emptySet());
+                                                                            Collections.emptySet(),
+                                                                            Collections.emptySet());
 
     private final HostInfo hostInfo;
     private final Set<String> stateStoreNames;
@@ -66,19 +66,27 @@ public class StreamsMetadata {
     public String host() {
         return hostInfo.host();
     }
+
+    @SuppressWarnings("unused")
     public int port() {
         return hostInfo.port();
     }
 
     @Override
     public boolean equals(final Object o) {
-        if (this == o) return true;
-        if (o == null || getClass() != o.getClass()) return false;
-
+        if (this == o) {
+            return true;
+        }
+        if (o == null || getClass() != o.getClass()) {
+            return false;
+        }
         final StreamsMetadata that = (StreamsMetadata) o;
-
-        if (!hostInfo.equals(that.hostInfo)) return false;
-        if (!stateStoreNames.equals(that.stateStoreNames)) return false;
+        if (!hostInfo.equals(that.hostInfo)) {
+            return false;
+        }
+        if (!stateStoreNames.equals(that.stateStoreNames)) {
+            return false;
+        }
         return topicPartitions.equals(that.topicPartitions);
 
     }
